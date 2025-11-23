@@ -1,13 +1,21 @@
-import cv2
 import streamlit as st
 import numpy as np
-import mediapipe as mp
 from tensorflow.keras.models import load_model
+from streamlit_drawable_canvas import st_canvas
+from PIL import Image, ImageOps
 import os
 
-st.title("✋ AirDraw AI - Real-time Sketch Recognition")
+st.set_page_config(page_title="AirDraw AI", page_icon="✋", layout="centered")
+st.title("✋ AirDraw AI – Sketch Recognition (Cloud Version)")
 
-# ------------------ Load model ------------------ #
+st.write(
+    """
+    Draw an object in the canvas below (e.g., **apple**, **house**, **tree**) and 
+    the model will try to recognize it.
+    """
+)
+
+# --------- Load model once --------- #
 @st.cache_resource
 def load_airdraw_model():
     model = load_model("airdraw_model.keras", compile=False)
@@ -15,121 +23,80 @@ def load_airdraw_model():
 
 model = load_airdraw_model()
 
-# If you trained only 'star', keep just that.
-# If you trained more classes, extend this list like ['cat', 'tree', 'car', 'star', 'house']
-labels = ['star']
+# Classes your model was trained on
+labels = ["apple", "house", "tree"]
 
+# --------- Canvas settings --------- #
+canvas_size = 256
 
-# ------------------ UI elements ------------------ #
-start = st.button("Start Drawing")
-clear_canvas = st.button("Clear Canvas")
-frame_placeholder = st.empty()
-canvas_placeholder = st.empty()
+st.subheader("✏️ Draw here")
+st.caption("Use white pen on black background. Click 'Clear' to reset.")
+
+# Canvas component
+canvas_result = st_canvas(
+    fill_color="#000000",        # background fill
+    stroke_width=10,             # pen thickness
+    stroke_color="#FFFFFF",      # white pen
+    background_color="#000000",  # black background
+    width=canvas_size,
+    height=canvas_size,
+    drawing_mode="freedraw",
+    key="canvas",
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    clear = st.button("🧹 Clear")
+with col2:
+    predict_btn = st.button("🔮 Predict")
+
+# Handle clear: just rerun, canvas resets automatically
+if clear:
+    st.experimental_rerun()
+
 prediction_placeholder = st.empty()
 image_placeholder = st.empty()
 
-# ------------------ Session state ------------------ #
-if "canvas" not in st.session_state or clear_canvas:
-    st.session_state.canvas = np.zeros((256, 256), dtype=np.uint8)
-
-canvas = st.session_state.canvas
-
-if start:
-    # Init MediaPipe Hands
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-        max_num_hands=1
-    )
-
-    # Try multiple camera indices
-    cap = None
-    for idx in [0, 1, 2]:
-        temp_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if temp_cap.isOpened():
-            cap = temp_cap
-            st.write(f"✅ Using camera index: {idx}")
-            break
-
-    if cap is None:
-        st.error("❌ Could not open any camera. Close other apps & try again.")
+# --------- Prediction logic --------- #
+if predict_btn:
+    if canvas_result.image_data is None:
+        st.warning("Draw something first on the canvas!")
     else:
-        frame_count = 0
+        # Get RGBA image from canvas
+        img_data = canvas_result.image_data.astype("uint8")
+        img = Image.fromarray(img_data)
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("Failed to read frame from camera.")
-                break
+        # Convert to grayscale
+        img = img.convert("L")  # L = (8-bit pixels, black and white)
 
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Invert if needed: we drew white on black; this makes it black on white
+        img = ImageOps.invert(img)
 
-            # --------- MediaPipe hand tracking --------- #
-            result = hands.process(rgb)
-            h, w, _ = frame.shape
+        # Resize to 28x28 as expected by the CNN
+        img_small = img.resize((28, 28), resample=Image.BILINEAR)
 
-            if result.multi_hand_landmarks:
-                for hand_landmarks in result.multi_hand_landmarks:
-                    # Index finger tip is landmark 8
-                    lm = hand_landmarks.landmark[8]
+        # Convert to numpy and normalize
+        arr = np.array(img_small).astype("float32") / 255.0
+        arr = arr.reshape(1, 28, 28, 1)
 
-                    # Position in camera frame (for visualization)
-                    cx = int(lm.x * w)
-                    cy = int(lm.y * h)
+        # Run prediction
+        preds = model.predict(arr)
+        idx = int(np.argmax(preds))
+        conf = float(np.max(preds))
+        label = labels[idx] if idx < len(labels) else "unknown"
 
-                    # Draw green dot on live camera frame
-                    cv2.circle(frame, (cx, cy), 8, (0, 255, 0), -1)
+        prediction_placeholder.markdown(
+            f"### 🔮 Prediction: **{label}**  \nConfidence: `{conf:.2f}`"
+        )
 
-                    # Map to 256x256 drawing canvas coordinates
-                    # lm.x and lm.y are in [0,1] relative space
-                    draw_x = int(lm.x * 255)
-                    draw_y = int(lm.y * 255)
+        # Show 28x28 processed image as a preview
+        st.subheader("📏 Model Input (28×28)")
+        st.image(img_small.resize((140, 140), resample=Image.NEAREST), caption="What the model sees", use_column_width=False)
 
-                    # Draw white dots on canvas
-                    cv2.circle(canvas, (draw_x, draw_y), 2, 255, -1)
-
-            # --------- Show live camera frame --------- #
-            frame_placeholder.image(rgb, channels="RGB")
-
-            # --------- Show drawing canvas --------- #
-            canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
-            canvas_placeholder.image(canvas_bgr, channels="BGR", caption="Drawing Canvas")
-
-            # --------- Predict every few frames if canvas has content --------- #
-            frame_count += 1
-            if frame_count % 10 == 0:  # every 10 frames
-                if np.count_nonzero(canvas) > 50:  # some drawing exists
-                    # Resize to 28x28 and normalize
-                    small = cv2.resize(canvas, (28, 28), interpolation=cv2.INTER_AREA)
-                    img_input = small.astype("float32") / 255.0
-                    img_input = img_input.reshape(1, 28, 28, 1)
-
-                    preds = model.predict(img_input)
-                    idx = int(np.argmax(preds))
-                    conf = float(np.max(preds))
-                    label = labels[idx] if idx < len(labels) else "unknown"
-
-                    prediction_placeholder.markdown(
-                        f"### 🔮 Prediction: **{label}** (confidence: `{conf:.2f}`)"
-                    )
-
-                    # Show corresponding real image if available
-                    img_path = os.path.join("real_images", f"{label}.jpg")
-                    if os.path.exists(img_path):
-                        image_placeholder.image(img_path, caption=f"Predicted: {label}")
-                    else:
-                        image_placeholder.write(f"Real image not found: {img_path}")
-
-            # --------- Break condition for loop --------- #
-            # Streamlit doesn't catch keypresses easily, so we use a limit
-            if frame_count > 400:  # roughly some seconds of drawing
-                st.info("⏹ Stopping after a few seconds. Click 'Start Drawing' again to continue.")
-                break
-
-        cap.release()
-        hands.close()
-
-    # Save back canvas to session_state so it's preserved across reruns
-    st.session_state.canvas = canvas
+        # Show corresponding real-world image if available
+        img_path = os.path.join("real_images", f"{label}.jpg")
+        if os.path.exists(img_path):
+            st.subheader("📷 Real Image")
+            image_placeholder.image(img_path, caption=f"Predicted: {label}")
+        else:
+            st.info(f"No real image found at `{img_path}`. Add one if you want to display it.")
